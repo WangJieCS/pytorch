@@ -70,7 +70,7 @@ from torch._guards import (
 )
 from torch._library.fake_class_registry import FakeScriptObject
 from torch._library.opaque_object import is_custom_class
-from torch._subclasses.fake_tensor import FakeTensor
+from torch._subclasses.fake_tensor import CppFakeTensorMode, FakeTensor
 from torch._utils_internal import signpost_event
 from torch.export.dynamic_shapes import _ConstraintTarget
 from torch.fx._lazy_graph_module import _make_graph_module  # type: ignore[attr-defined]
@@ -805,6 +805,7 @@ class OutputGraph(OutputGraphCommon):
         # of the user marked dynamic dims
         import torch._functorch.config as _config
 
+        fake_mode: torch._subclasses.FakeTensorMode | CppFakeTensorMode
         with _config.patch(fake_tensor_allow_unsafe_data_ptr_access=False):
             fake_mode = torch._subclasses.FakeTensorMode(
                 shape_env=shape_env,
@@ -1451,7 +1452,7 @@ class OutputGraph(OutputGraphCommon):
         return self
 
     @property
-    def fake_mode(self) -> torch._subclasses.FakeTensorMode:
+    def fake_mode(self) -> torch._subclasses.FakeTensorMode | CppFakeTensorMode:
         if self.tracing_context.fake_mode is None:
             raise AssertionError("tracing_context.fake_mode must not be None")
         return self.tracing_context.fake_mode
@@ -3047,7 +3048,7 @@ class OutputGraph(OutputGraphCommon):
                 # registered backends covered by convert_frame weakref cleanup.
                 # Backends have already consumed the graph, so non-CPU Dynamo
                 # tracing constants no longer need to keep real tensors alive.
-                old_fake_mode.fake_tensor_converter.clear_non_cpu_constants()
+                old_fake_mode.clear_non_cpu_constants()
 
             if self.package is not None:
                 self.package.add_backend_id(name, compiled_fn)
@@ -4279,11 +4280,14 @@ class SubgraphTracer(fx.Tracer):
     ) -> fx.Proxy:
         if isinstance(example_value, torch.Tensor):
             self._input_versions_at_beginning.append(example_value._version)
+            ev_str = f"{example_value.__class__.__name__}(..., size={tuple(example_value.shape)})"
+        else:
+            ev_str = example_value
         log.debug(
             "create_graph_input %s %s %s at debug_level %s before=%s",
             name,
             source.name if source is not None else "(none)",
-            example_value,
+            ev_str,
             self.debug_level,
             before,
         )
