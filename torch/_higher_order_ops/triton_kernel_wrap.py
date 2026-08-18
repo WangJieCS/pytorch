@@ -86,7 +86,7 @@ TMAExperimentalMetadata = tuple[
 # the metadata will look like ``("stable", ([32, 64],))``
 TMAStableMetadata = tuple[
     str,  # type of TMA ("experimental" or "stable")
-    tuple[list[IntLikeType],],  # block_shape
+    tuple[list[IntLikeType], str, str],  # block_shape, module, class
 ]
 
 
@@ -110,13 +110,15 @@ def maybe_unpack_tma_experimental_metadata(
 
 def create_tma_stable_metadata(
     block_shape: list[IntLikeType],
+    descriptor_module: str = "triton.tools.tensor_descriptor",
+    descriptor_class: str = "TensorDescriptor",
 ) -> TMAStableMetadata:
-    return ("stable", (block_shape,))
+    return ("stable", (block_shape, descriptor_module, descriptor_class))
 
 
 def maybe_unpack_tma_stable_metadata(
     tma_meta: TMAExperimentalMetadata | TMAStableMetadata,
-) -> tuple[list[IntLikeType]] | None:
+) -> tuple[list[IntLikeType], str, str] | None:
     if not tma_meta or len(tma_meta) != 2:
         return None
     if tma_meta[0] == "stable":
@@ -260,7 +262,6 @@ def generate_ttir(
         triton_version_uses_attrs_dict,
         TritonAttrsDescriptorVersion,
     )
-    from torch.utils._triton import has_triton_tensor_descriptor_host_tma
 
     triton_version = get_triton_attrs_descriptor_version()
 
@@ -309,9 +310,12 @@ def generate_ttir(
                 tma_descriptor_metadata.get(name, None)
             )
         ) is not None:
-            from triton.tools.tensor_descriptor import TensorDescriptor
+            import importlib
 
-            block_shape = stable_meta[0]
+            block_shape, descriptor_module, descriptor_class = stable_meta
+            descriptor_type = getattr(
+                importlib.import_module(descriptor_module), descriptor_class
+            )
             with torch._C._DisableTorchDispatch():
                 # need 16-byte aligned strides
                 elements_per_dim = max(1, 16 // a.dtype.itemsize)
@@ -319,20 +323,12 @@ def generate_ttir(
                     [elements_per_dim] * len(block_shape), dtype=a.dtype
                 )
 
-            ordered_args[name] = TensorDescriptor.from_tensor(base_tensor, block_shape)
+            ordered_args[name] = descriptor_type.from_tensor(base_tensor, block_shape)
         elif is_fake_tensor(a) or isinstance(a, torch._inductor.ir.TensorBox):
             with torch._C._DisableTorchDispatch():
                 ordered_args[name] = torch.empty(2, dtype=a.dtype)
         else:
             ordered_args[name] = a
-
-    def is_stable_tensor_descriptor_arg(arg: Any) -> bool:
-        if has_triton_tensor_descriptor_host_tma():
-            from triton.tools.tensor_descriptor import TensorDescriptor
-
-            if isinstance(arg, TensorDescriptor):
-                return True
-        return False
 
     def _is_constexpr_or_none(name: str, arg: Any) -> bool:
         param_idx = kernel.arg_names.index(name)
@@ -355,7 +351,7 @@ def generate_ttir(
         if _is_constexpr_or_none(name, arg):
             return []
 
-        if is_stable_tensor_descriptor_arg(arg):
+        if maybe_unpack_tma_stable_metadata(tma_descriptor_metadata.get(name, None)):
             stable_meta = maybe_unpack_tma_stable_metadata(
                 tma_descriptor_metadata[name]
             )
@@ -1468,11 +1464,14 @@ def triton_kernel_wrapper_mutation_dense(
                     raise AssertionError(
                         f"Failed to unpack stable TMA metadata for key {k}"
                     )
-                from triton.tools.tensor_descriptor import TensorDescriptor
+                import importlib
 
-                block_shape = stable_meta[0]
+                block_shape, descriptor_module, descriptor_class = stable_meta
+                descriptor_type = getattr(
+                    importlib.import_module(descriptor_module), descriptor_class
+                )
 
-                kwargs[k] = TensorDescriptor.from_tensor(tensor, block_shape)
+                kwargs[k] = descriptor_type.from_tensor(tensor, block_shape)
 
     # move as many positional arguments from dicts to args as we
     # can to circumvent the bug with the kwargs and pre_/post_hook:

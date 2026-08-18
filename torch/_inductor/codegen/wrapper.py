@@ -2403,7 +2403,8 @@ class PythonWrapperCodegen(CodeGen):
         if apply_size_hints:
             block_shape = V.graph.sizevars.optimization_hints(block_shape)
 
-        prefix = "triton.tools.tensor_descriptor.TensorDescriptor"
+        self.header.writeline(f"import {desc.descriptor_module}")
+        prefix = f"{desc.descriptor_module}.{desc.descriptor_class}"
         fn = f"{prefix}.from_tensor"
         args = f"{desc.tensor.codegen_reference()}, {block_shape}"
         call = f"{fn}({args})"

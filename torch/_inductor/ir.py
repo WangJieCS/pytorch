@@ -8545,8 +8545,16 @@ class TMADescriptorStable(TMADescriptor):
     See also TMADescriptorExperimental for the old API.
     """
 
-    def __init__(self, tensor: IRNode, block_shape: list[int | torch.SymInt]):
+    def __init__(
+        self,
+        tensor: IRNode,
+        block_shape: list[int | torch.SymInt],
+        descriptor_module: str = "triton.tools.tensor_descriptor",
+        descriptor_class: str = "TensorDescriptor",
+    ):
         self.block_shape = block_shape
+        self.descriptor_module = descriptor_module
+        self.descriptor_class = descriptor_class
 
         super().__init__(
             tensor=tensor,

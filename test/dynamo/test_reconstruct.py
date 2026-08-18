@@ -9,7 +9,7 @@ import torch
 import torch._dynamo.test_case
 import torch._dynamo.testing
 from torch.testing._internal.common_utils import IS_FBCODE
-from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU
+from torch.testing._internal.inductor_utils import GPU_TYPE, HAS_GPU, TRITON_HAS_CPU
 from torch.utils._triton import (
     has_triton_experimental_host_tma,
     has_triton_tensor_descriptor_host_tma,
@@ -551,6 +551,27 @@ class ReconstructTest(torch._dynamo.test_case.TestCase):
         res = torch.compile(create_tma, backend=backend)(x)
         self.assertEqual(len(backend.graphs), 1)
         self.assertEqual(ref, res)
+
+    @unittest.skipIf(not TRITON_HAS_CPU, "requires Triton CPU backend")
+    def test_tma_stable_cpu_subclass_reconstruct(self):
+        from triton.backends.cpu.tensor_descriptor import (
+            TensorDescriptor as CPUTensorDescriptor,
+        )
+
+        def create_tma(tensor):
+            descriptor = CPUTensorDescriptor.from_tensor(tensor, [16])
+            return tensor + 1, descriptor
+
+        x = torch.randn(16)
+        backend = torch._dynamo.testing.EagerAndRecordGraphs()
+        result, descriptor = torch.compile(create_tma, backend=backend, fullgraph=True)(
+            x
+        )
+
+        self.assertEqual(len(backend.graphs), 1)
+        self.assertEqual(result, x + 1)
+        self.assertIsInstance(descriptor, CPUTensorDescriptor)
+        self.assertEqual(descriptor.block_shape, [16])
 
     def test_self_referential_sourceful(self):
         l = []
