@@ -1,0 +1,181 @@
+import itertools
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class GluonGroupedMMConfig:
+    BLOCK_M: int
+    BLOCK_N: int
+    BLOCK_K: int
+    NUM_LOAD_BUFFERS: int
+    NUM_ACC_BUFFERS: int
+    NUM_STORE_WARPS: int = 4
+    GROUP_SIZE_N: int = 1
+
+
+def compute_stage_variants_gluon(
+    BLOCK_M: int,
+    BLOCK_N: int,
+    BLOCK_K: int,
+    dtype,
+    tmem_max_columns: int = 512,
+    max_configs: int = 1,
+    uses_c_smem: bool = True,
+):
+    """
+    Compute valid (NUM_LOAD_BUFFERS, NUM_ACC_BUFFERS) pairs for the
+    given block dimensions, sampled evenly across the valid range so
+    the result isn't biased toward the largest NUM_LOAD_BUFFERS that
+    fits. Returns at most max_configs pairs.
+
+    uses_c_smem must match the kernel: the C staging buffer only
+    exists on the TMA store path, so budgeting for it when C is 2D
+    reserves memory the kernel never uses and caps NUM_LOAD_BUFFERS.
+    """
+    import torch
+
+    dtype_bytes = torch.tensor([], dtype=dtype).element_size()
+    smem_limit = 227 * 1024  # hardware limit
+
+    a_bytes_per_stage = BLOCK_M * BLOCK_K * dtype_bytes
+    b_bytes_per_stage = BLOCK_N * BLOCK_K * dtype_bytes
+    c_bytes_per_stage = BLOCK_M * BLOCK_N * dtype_bytes if uses_c_smem else 0
+    ab_bytes_per_stage = a_bytes_per_stage + b_bytes_per_stage
+
+    # The masked store path converts the accumulator to a coalesced
+    # layout, staging through a fixed-size shared memory scratch.
+    convert_layout_smem = 0 if uses_c_smem else 16 * 1024
+
+    min_load_buffers = 1
+    min_acc_buffers = 1
+    compiler_overhead = 256
+
+    min_smem = (
+        ab_bytes_per_stage * min_load_buffers
+        + c_bytes_per_stage
+        + convert_layout_smem
+        + 8 * min_load_buffers * 2
+        + 8 * min_acc_buffers * 2
+        + compiler_overhead
+    )
+
+    if min_smem > smem_limit:
+        return []
+
+    # Pipeline depth dominates: one CTA per SM leaves no spare warps to
+    # hide load latency. Bound it by shared memory, not a constant.
+    max_load_buffers = (smem_limit - c_bytes_per_stage - convert_layout_smem) // (
+        ab_bytes_per_stage + 8 * 2
+    )
+
+    all_valid = []
+    for num_load_buffers in range(max_load_buffers, 0, -1):
+        ab_smem = ab_bytes_per_stage * num_load_buffers
+        c_smem = c_bytes_per_stage
+        load_barrier_smem = 8 * num_load_buffers * 2
+
+        base_smem = (
+            ab_smem
+            + c_smem
+            + convert_layout_smem
+            + load_barrier_smem
+            + compiler_overhead
+        )
+
+        if base_smem > smem_limit:
+            continue
+
+        max_acc_by_tmem = tmem_max_columns // BLOCK_N
+        remaining_smem = smem_limit - base_smem
+        max_acc_by_smem = remaining_smem // (8 * 2)
+
+        max_acc_buffers = min(max_acc_by_tmem, max_acc_by_smem, 8)
+
+        for num_acc_buffers in range(max_acc_buffers, 0, -1):
+            acc_barrier_smem = 8 * num_acc_buffers * 2
+            total_smem = base_smem + acc_barrier_smem
+            tmem_cols = BLOCK_N * num_acc_buffers
+
+            if total_smem <= smem_limit and tmem_cols <= tmem_max_columns:
+                all_valid.append((num_load_buffers, num_acc_buffers))
+
+    if len(all_valid) <= max_configs:
+        return all_valid
+
+    stride = len(all_valid) / max_configs
+    return [all_valid[int(i * stride)] for i in range(max_configs)]
+
+
+def get_grouped_mm_configs(
+    dtype_AB,
+    exhaustive: bool = False,
+    uses_c_smem: bool = True,
+) -> list[GluonGroupedMMConfig]:
+    """
+    Returns the configuration set for the Gluon Grouped MM kernel,
+    sized to match the CuTeDSL grouped-gemm heuristic's config counts
+    (torch/_inductor/heuristics/template/cutedsl.py).
+
+    Args:
+        dtype_AB: Data type for A and B matrices
+        exhaustive: If True, use the full search space
+        uses_c_smem: Whether the kernel allocates the C staging buffer
+
+    Returns:
+        List of GluonGroupedMMConfig objects
+    """
+    # NUM_STORE_WARPS measured under 1% across 4/8/16, and the deepest
+    # pipeline that fits won on every shape tried, so neither earns a
+    # search dimension. BLOCK_K=32 never won either, so it is only kept
+    # in the exhaustive space.
+    if exhaustive:
+        block_combos = list(itertools.product([64, 128], [32, 64, 128, 256]))
+        BLOCK_K_vals = [32, 64, 128, 256]
+        NUM_STORE_WARP_vals = [8]
+        GROUP_SIZE_N_vals = [1, 4, 8, 16]
+        buffer_configs_per_combo = 1
+    else:
+        block_combos = [
+            (64, 32),
+            (64, 64),
+            (64, 128),
+            (64, 256),
+            (128, 64),
+            (128, 128),
+            (128, 256),
+        ]
+        BLOCK_K_vals = [64, 128]
+        NUM_STORE_WARP_vals = [8]
+        GROUP_SIZE_N_vals = [1, 8]
+        buffer_configs_per_combo = 1
+
+    configs = []
+    for (BLOCK_M, BLOCK_N), BLOCK_K, num_store_warps, group_size_n in itertools.product(
+        block_combos,
+        BLOCK_K_vals,
+        NUM_STORE_WARP_vals,
+        GROUP_SIZE_N_vals,
+    ):
+        buffer_variants = compute_stage_variants_gluon(
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            dtype=dtype_AB,
+            max_configs=buffer_configs_per_combo,
+            uses_c_smem=uses_c_smem,
+        )
+
+        for num_load_buffers, num_acc_buffers in buffer_variants:
+            configs.append(
+                GluonGroupedMMConfig(
+                    BLOCK_M=BLOCK_M,
+                    BLOCK_N=BLOCK_N,
+                    BLOCK_K=BLOCK_K,
+                    NUM_LOAD_BUFFERS=num_load_buffers,
+                    NUM_ACC_BUFFERS=num_acc_buffers,
+                    NUM_STORE_WARPS=num_store_warps,
+                    GROUP_SIZE_N=group_size_n,
+                )
+            )
+
+    return configs
