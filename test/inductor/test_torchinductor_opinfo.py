@@ -22,6 +22,7 @@ from torch._subclasses.fake_tensor import (
 )
 from torch.testing._internal.common_cuda import SM80OrLater
 from torch.testing._internal.common_device_type import (
+    Capability,
     instantiate_device_type_tests,
     onlyAccelerator,
     OpDTypes,
@@ -54,7 +55,6 @@ from torch.testing._internal.inductor_utils import (
     GPU_TYPE,
     HAS_CPU,
     HAS_CUDA_AND_TRITON,
-    has_triton,
     HAS_XPU_AND_TRITON,
     maybe_skip_size_asserts,
 )
@@ -1529,7 +1529,7 @@ class TestInductorOpInfo(TestCase):
 
                         # Backend-specific adjustments
                         # Triton
-                        if has_triton():
+                        if self.has_capabilities(Capability.lib.triton):
                             adjusted_kwargs.update(
                                 copy_to_gpu=False,
                             )
