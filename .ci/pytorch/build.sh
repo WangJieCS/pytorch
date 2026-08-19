@@ -283,6 +283,56 @@ if [[ "$BUILD_ENVIRONMENT" != *libtorch* ]]; then
   fi
   pip_install_whl "$(echo dist/*.whl)"
 
+  # native-AOT stage 2: export DSL kernels, relink torch_cuda with them
+  # embedded, and patch the relinked library back into the wheel handed
+  # to test jobs. Needs the INSTALLED torch (kernel builders import it),
+  # which is why it runs post-install rather than inside the PEP 517
+  # build. Skips cleanly (printing why) with TORCH_NATIVE_AOT=0, when no
+  # toolchain targets this backend, when nothing declares kernels, when the
+  # interpreter has no DSL wheel, or when no supported arch is targeted. Past
+  # those checks the DSL runtimes are required and any failure fails the build.
+  # See tools/native_aot/build_stage2.py.
+  #
+  # CUDA-only, the same guard .ci/manywheel/build.sh applies, and it is about
+  # more than saving two subprocesses: --wheel tells stage 2 that torch was
+  # installed on the line above, so a torch that does not import is a broken
+  # build and it refuses rather than patching a kernel-free wheel. In the ASan
+  # and TSan images plain `import torch` legitimately does NOT work (test.sh
+  # LD_PRELOADs the sanitizer runtime / switches to a TSan interpreter, and
+  # neither happens here), so without this guard that refusal failed those
+  # builds -- and TORCH_NATIVE_AOT=0 could not exempt them, since the refusal
+  # is deliberately ahead of every applicability gate.
+  if [[ "$BUILD_ENVIRONMENT" == *cuda* ]]; then
+  # The DSL wheels are installed HERE rather than in
+  # .ci/docker/requirements-ci.txt: that file is shared by every image, so
+  # pinning them there put ~190 MB of CUDA-only tooling into the CPU, ROCm
+  # and XPU images -- and made capability probes lie there (a ROCm image
+  # with the wheel reports CUTLASS available, then fails cuInit).
+  # ONE owner of the decision: stage 2 prints its own verdict and we install
+  # only when it says RUN. An independent `python -c` probe here used to decide
+  # by exit code, which disagrees with stage 2's stdout-based probe on GPU-less
+  # CUDA builders -- a CUDA torch can segfault in interpreter teardown there
+  # (seen on the b200 build job), so the exit code said "not CUDA", the install
+  # was skipped, and stage 2 then failed the build demanding the runtimes.
+  if [[ "$(python tools/native_aot/build_stage2.py --print-verdict)" == "RUN" ]]; then
+    install_cutlass_dsl
+  fi
+  # One wheel expected; a stale second one in dist/ would otherwise be glued
+  # into a single argument containing a space. nullglob so an empty dist/ is
+  # reported as the zero it is: without it the glob yields the literal pattern
+  # as a single element, and the count in the message read "found 1", which
+  # sends the reader looking for a second wheel rather than for none.
+  naot_wheels=()
+  shopt -s nullglob
+  naot_wheels=(dist/*.whl)
+  shopt -u nullglob
+  if [[ ${#naot_wheels[@]} -ne 1 ]]; then
+    echo "native-AOT: expected exactly one wheel in dist/, found ${#naot_wheels[@]}" >&2
+    exit 1
+  fi
+  python tools/native_aot/build_stage2.py --wheel "${naot_wheels[0]}"
+  fi  # BUILD_ENVIRONMENT == *cuda*
+
   # Smoke-test tools/build_with_debinfo.py against the real build tree: it must
   # still emit a debug-rebuild plan with a -g compile and the libtorch_python
   # relink. This guards against build-system changes (e.g. a new

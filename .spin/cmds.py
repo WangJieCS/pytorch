@@ -569,6 +569,22 @@ def _pip_install_cmd(editable):
     return cmd + [".", "-v", "--no-build-isolation"]
 
 
+def _native_aot_stage2():
+    # Post-install: the kernel builders import the installed torch, and
+    # scikit-build-core has no post-build hook inside the PEP 517 backend.
+    #
+    # Skips cleanly (printing why) when AOT kernels do not apply to this build --
+    # no CUDA, no exportable arch, nothing declaring kernels; see
+    # tools/native_aot/build_stage2.py for the full list. It does NOT skip for a
+    # missing DSL runtime: once it decides it will export, an absent runtime is a
+    # hard error (a wheel missing declared kernels underperforms silently), and
+    # spin.util.run exits non-zero on it. On a machine with an exportable GPU
+    # that means `spin develop` needs the DSL wheels installed -- CI does that
+    # with install_cutlass_dsl in .ci/pytorch/common_utils.sh -- or
+    # TORCH_NATIVE_AOT=0 to build without embedded kernels.
+    spin.util.run([sys.executable, "tools/native_aot/build_stage2.py"])
+
+
 @click.command()
 def develop():
     """Build PyTorch (editable install).
@@ -579,6 +595,7 @@ def develop():
     CMakeLists.txt and the supported env vars in cmake/EnvVarForwarding.cmake.
     """
     spin.util.run(_pip_install_cmd(editable=True))
+    _native_aot_stage2()
 
 
 # Alias so `spin editable` also works.
@@ -596,6 +613,7 @@ def install():
     CMakeLists.txt and the supported env vars in cmake/EnvVarForwarding.cmake.
     """
     spin.util.run(_pip_install_cmd(editable=False))
+    _native_aot_stage2()
 
 
 PYREFLY_LINTER_SCRIPT = CWD / "tools" / "linter" / "adapters" / "pyrefly_linter.py"

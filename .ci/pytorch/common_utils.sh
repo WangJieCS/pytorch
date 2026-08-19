@@ -364,18 +364,23 @@ function install_flash_attn_cute() {
 }
 
 function install_cutlass_dsl() {
-  # cutlass-dsl requires Python >= 3.12
-  local py_version
-  py_version=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-  if [[ "$(echo -e "3.12\n$py_version" | sort -V | head -n1)" != "3.12" ]]; then
-    echo "Skipping CUTLASS DSL install: requires Python >= 3.12, have $py_version"
-    return 0
-  fi
-
   echo "Installing NVIDIA CUTLASS DSL from PyPI..."
   # Pin to a version accepted by torch._native's cutedsl version gate
   # (_CUTEDSL_REQUIRED_VERSIONS); apache-tvm-ffi is a required runtime dep of
   # the CuTeDSL op overrides but is not pulled in by nvidia-cutlass-dsl.
+  #
+  # Installs unconditionally: native-AOT stage 2 calls this only after deciding
+  # it WILL export, and then treats a missing runtime as a build failure -- so a
+  # silent skip here would turn into a failed build rather than a slower one.
+  # (A Python-version guard used to live here, on the premise that the DSL needs
+  # 3.12. Dropped because the real floor is lower, not because there is no floor:
+  # nvidia-cutlass-dsl itself is py3-none-any, but its mandatory
+  # nvidia-cutlass-dsl-libs-* and apache-tvm-ffi are cp-tagged manylinux wheels,
+  # published for cp310-cp314 (plus cp314t) as of the pin above -- so 3.10 and
+  # 3.11 resolve fine, while a future pin whose libs-* floor rises would fail
+  # here. build_stage2.should_run() carries the matching interpreter gate; the
+  # sibling install_cutlass_api keeps its own >=3.12 guard because THAT package
+  # requires 3.12.)
   pip_install nvidia-cutlass-dsl==4.6.2 apache-tvm-ffi==0.1.11
   echo "NVIDIA CUTLASS DSL installation complete."
 }
