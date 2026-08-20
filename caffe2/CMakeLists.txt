@@ -1152,6 +1152,14 @@ elseif(USE_CUDA)
   if(BUILD_LAZY_CUDA_LINALG)
     add_library(torch_cuda_linalg ${ATen_CUDA_LINALG_SRCS})
     target_compile_definitions(torch_cuda_linalg PRIVATE USE_CUDA BUILD_LAZY_CUDA_LINALG)
+    # This target is not built through torch_compile_options(), so it does not
+    # pick up the -Wno-interference-size added there for GCC 12+ (#166297).
+    # ATen/core/CachingHostAllocator.h aligns on
+    # std::hardware_destructive_interference_size, whose value varies with
+    # -mtune, and the global -Werror turns that warning into a build failure.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12)
+      target_compile_options(torch_cuda_linalg PRIVATE -Wno-interference-size)
+    endif()
     # Library order is important during static linking
     # `torch::magma` should be mentioned before other CUDA
     # to transitively include all symbols present in torch_cuda/torch_cpu
