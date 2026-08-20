@@ -158,6 +158,23 @@ class DeviceInterface:
         return False
 
     @classmethod
+    def get_multi_processor_count(cls, device: torch.types.Device = None) -> int:
+        """Return the number of compute units, used for occupancy /
+        reduction heuristics / max-autotune heuristics.  Defaults to
+        reading the standard field ``multi_processor_count`` from device
+        properties; backends whose native field name differs (XPU, MTIA)
+        must override."""
+        props = cls.get_device_properties(device)
+        mp_count = getattr(props, "multi_processor_count", None)
+        if mp_count is None:
+            raise AttributeError(
+                f"{cls.__name__} must override get_multi_processor_count "
+                f"because its device properties do not expose the standard "
+                f"field 'multi_processor_count'"
+            )
+        return mp_count
+
+    @classmethod
     def raise_if_triton_unavailable(cls, device: torch.types.Device = None) -> None:
         """
         Raises a `TritonUnavailableError` with human-readable instructions if
@@ -374,6 +391,10 @@ class MtiaInterface(DeviceInterface):
         ret = torch.mtia.is_available()
         return ret
 
+    @classmethod
+    def get_multi_processor_count(cls, device: torch.types.Device = None) -> int:
+        return 64
+
     @staticmethod
     def get_compute_capability(device: torch.types.Device = None) -> Any:
         cc = torch.mtia.get_device_capability(device)
@@ -458,6 +479,10 @@ class XpuInterface(DeviceInterface):
     @staticmethod
     def is_available() -> bool:
         return torch.xpu.is_available()
+
+    @classmethod
+    def get_multi_processor_count(cls, device: torch.types.Device = None) -> int:
+        return cls.get_device_properties(device).gpu_subslice_count
 
     @staticmethod
     def get_compute_capability(device: torch.types.Device = None) -> Any:

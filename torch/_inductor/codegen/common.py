@@ -325,6 +325,10 @@ device_codegens: dict[str, DeviceCodegen] = {}
 
 
 class DeviceOpOverrides:
+    def uses_gpu_cpp_wrapper(self) -> bool:
+        """Return whether this device uses the GPU-style C++ wrapper path."""
+        return False
+
     def import_get_raw_stream_as(self, name: str) -> str:
         raise NotImplementedError
 
