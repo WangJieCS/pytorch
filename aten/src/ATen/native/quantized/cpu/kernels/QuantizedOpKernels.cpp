@@ -1,7 +1,4 @@
 #define TORCH_ASSERT_ONLY_METHOD_OPERATORS
-#include <climits>
-#include <limits>
-#include <cstring>
 #include <ATen/core/Tensor.h>
 #include <ATen/core/List.h>
 #include <ATen/Dispatch.h>

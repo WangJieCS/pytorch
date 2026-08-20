@@ -1,5 +1,4 @@
 #define TORCH_ASSERT_NO_OPERATORS
-#include <cstring>
 #include <ATen/Dispatch.h>
 #include <ATen/Parallel.h>
 #include <ATen/cpu/vec/vec.h>
