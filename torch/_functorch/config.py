@@ -423,6 +423,16 @@ guess_tangent_strides_as_outputs = not is_fbcode()
 # it will ultimately be removed once we share size_hints across ranks through compiler collectives
 _sync_decision_cross_ranks = False
 
+# Compilation itself issues collectives, for example, when _sync_decision_cross_ranks is
+# set, those collectives only run on the ranks that actually compile, so a cache hit on
+# one rank and a miss on another desyncs the process group and hangs. This config makes
+# the outcome uniform: after every rank has consulted AOTAutogradCache, the hits are discarded
+# unless *all* ranks hit.
+# Synchronizing the outcome rather than the cache key is deliberate. A key only covers
+# whether an entry exists; a rank can find its entry and still miss because the entry's
+# dynamic shape guards do not hold for that rank's hints (`guard_miss`).
+_sync_cache_decision_cross_ranks = False
+
 # By default apply inlined saved_tensors_hooks only for "donated" buffers.
 # "donated" buffers are invisible to the user, they are intermediates of the forward graph.
 # Applying saved tensors hooks for memory optimizations only for intermediates

@@ -2725,7 +2725,9 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
         device_type = torch.accelerator.current_accelerator().type
         return torch.device(f"{device_type}:{self.rank}")
 
-    def _init_process_group(self) -> None:
+    def _init_process_group(
+        self, timeout: datetime.timedelta | None = None
+    ) -> None:
         torch._inductor.config.triton.store_cubin = True
         torch._inductor.config.debug = True
 
@@ -2740,6 +2742,7 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
             world_size=self.world_size,
             rank=self.rank,
             store=store,
+            timeout=timeout,
         )
         torch._C._distributed_c10d._register_process_group(
             "default", torch.distributed.group.WORLD
@@ -2996,6 +2999,54 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
         _extract_graph_with_inputs_outputs(
             test_graph, bwd_inputs, bwd_outputs, bwd_descs
         )
+
+    @skip_if_lt_x_gpu(2)
+    def test_sync_cache_decision_cross_ranks(self):
+        # A cache hit on one rank and a miss on another leaves only the missing rank
+        # inside _sync_decision_cross_ranks, which desyncs the process group. The hit
+        # must be discarded unless every rank hit.
+        from torch._dynamo.utils import counters
+        from torch._functorch._aot_autograd.autograd_cache import (
+            sync_cache_decision_cross_ranks,
+        )
+
+        self._init_process_group()
+
+        def compiled_fn():
+            pass
+
+        # Not a GraphModule, so it is conservatively treated as having collectives.
+        mod = torch.nn.Module()
+
+        with torch._functorch.config.patch(_sync_cache_decision_cross_ranks=True):
+            self.assertIs(
+                sync_cache_decision_cross_ranks(compiled_fn, mod), compiled_fn
+            )
+            self.assertIsNone(sync_cache_decision_cross_ranks(None, mod))
+
+            counters.clear()
+            # Rank 0 hits, rank 1 misses.
+            local = compiled_fn if self.rank == 0 else None
+            self.assertIsNone(sync_cache_decision_cross_ranks(local, mod))
+            self.assertEqual(
+                counters["aot_autograd"]["autograd_cache_cross_rank_miss"],
+                1 if self.rank == 0 else 0,
+            )
+
+        # Disabled by default, so a lone hit survives and no collective is issued.
+        local = compiled_fn if self.rank == 0 else None
+        self.assertIs(sync_cache_decision_cross_ranks(local, mod), local)
+
+    @skip_if_lt_x_gpu(2)
+    def test_compile_sync_pg_inherits_default_timeout(self):
+        from torch._dynamo.distributed import get_compile_sync_pg
+
+        timeout = datetime.timedelta(seconds=120)
+        self._init_process_group(timeout=timeout)
+
+        pg = get_compile_sync_pg()
+        device = torch.device(c10d.distributed_c10d._get_object_coll_device(pg))
+        self.assertEqual(pg._get_backend(device).options._timeout, timeout)
 
     @skip_if_lt_x_gpu(2)
     def test_align_runtime_estimations_across_all_distributed_ranks(self):
@@ -3916,6 +3967,35 @@ class TestSyncDecisionCrossRanks(MultiProcessTestCase):
         for n in (7, 11):
             x = torch.randn(n, HIDDEN, device=self.device)
             compiled(x, w, group_size, group_name)
+
+
+class TestHasCollectives(torch._dynamo.test_case.TestCase):
+    @staticmethod
+    def _gm(with_collective: bool) -> torch.fx.GraphModule:
+        graph = torch.fx.Graph()
+        out = graph.placeholder("x")
+        if with_collective:
+            out = graph.call_function(
+                torch.ops._c10d_functional.all_reduce.default, (out, "sum", "0")
+            )
+        graph.output(out)
+        return torch.fx.GraphModule(torch.nn.Module(), graph)
+
+    def test_has_collectives(self):
+        from torch._functorch._aot_autograd.autograd_cache import (
+            _has_collectives,
+        )
+
+        # Nothing to inspect, so assume the worst rather than risk desyncing ranks.
+        self.assertTrue(_has_collectives(torch.nn.Module()))
+
+        self.assertFalse(_has_collectives(self._gm(False)))
+        self.assertTrue(_has_collectives(self._gm(True)))
+
+        # A collective reachable only through a subgraph still counts.
+        parent = self._gm(False)
+        parent.add_module("subgraph", self._gm(True))
+        self.assertTrue(_has_collectives(parent))
 
 
 class TestNodeGroupNameResolution(torch._dynamo.test_case.TestCase):

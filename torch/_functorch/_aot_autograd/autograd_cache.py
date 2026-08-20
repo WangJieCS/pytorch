@@ -143,6 +143,92 @@ def should_bundle_autograd_cache() -> bool:
     return config.bundled_autograd_cache or torch._dynamo.config.caching_precompile
 
 
+def _has_collectives(mod: torch.nn.Module) -> bool:
+    """
+    Whether ``mod`` contains functional collectives. Submodule graphs are scanned as
+    well, so a collective reachable only through a higher order op subgraph still
+    counts. Anything we cannot inspect is assumed to contain collectives, since a false
+    negative desyncs the ranks.
+    """
+    inspected = False
+    for submod in mod.modules():
+        # Not isinstance(submod, GraphModule): standalone inductor can hand us a
+        # GraphModule with no .graph on it, see the bypass comment in try_load.
+        graph = getattr(submod, "graph", None)
+        if not isinstance(graph, torch.fx.Graph):
+            continue
+        inspected = True
+        for node in graph.nodes:
+            if isinstance(
+                node.target, torch._ops.OpOverload
+            ) and node.target.namespace in {"_c10d_functional", "c10d_functional"}:
+                return True
+    return not inspected
+
+
+def sync_cache_decision_cross_ranks(
+    compiled_fn: Callable[..., Any] | None,
+    mod: torch.nn.Module,
+) -> Callable[..., Any] | None:
+    """
+    Drop a local AOTAutogradCache hit unless every rank hit as well.
+
+    Compilation itself issues collectives (see config._sync_decision_cross_ranks and the
+    inductor pass that reorders collectives), and only the ranks that actually compile
+    reach them, so the hit/miss decision has to be unanimous. Every rank that could
+    reach one of those collectives should call this.
+
+    The outcome is synchronized rather than the cache key: a key only says which entries
+    are candidates, while the hit is decided afterwards by evaluating each candidate's
+    dynamic shape guards against rank local hints, which can diverge for equal keys.
+    """
+    if not config._sync_cache_decision_cross_ranks:
+        return compiled_fn
+
+    dist = torch.distributed
+    if not (dist.is_available() and dist.is_initialized()):
+        return compiled_fn
+    if dist.get_world_size() < 2:
+        return compiled_fn
+    if not _has_collectives(mod):
+        return compiled_fn
+
+    from torch._dynamo.distributed import get_compile_sync_pg
+
+    pg = get_compile_sync_pg()
+    if pg is None:
+        return compiled_fn
+
+    from torch._subclasses.fake_tensor import unset_fake_temporarily
+    from torch.utils._mode_utils import no_dispatch
+
+    local_hit = compiled_fn is not None
+
+    with no_dispatch(), unset_fake_temporarily():
+        decision = torch.tensor(
+            [local_hit],
+            dtype=torch.int32,
+            device=dist.distributed_c10d._get_object_coll_device(pg),
+        )
+        dist.all_reduce(decision, op=dist.ReduceOp.MIN, group=pg)
+        all_ranks_hit = bool(decision.item())
+
+    if all_ranks_hit:
+        return compiled_fn
+
+    # The collective only carries whether every rank hit, so each rank reports its
+    # own decision here: grep for local_hit=False to find the ranks that missed.
+    log.info(
+        "AOTAutograd cache cross rank miss: rank=%d local_hit=%s",
+        dist.get_rank(),
+        local_hit,
+    )
+
+    if local_hit:
+        counters["aot_autograd"]["autograd_cache_cross_rank_miss"] += 1
+    return None
+
+
 def check_node_safe(node: Node) -> None:
     """
     Checks that the node only uses supported operators. We are starting with very
@@ -1162,6 +1248,17 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradResult[Any, Any]]):
                 log_cache_bypass("bypass_aot_autograd", str(e))
             if config.strict_autograd_cache or torch._dynamo.config.strict_precompile:
                 raise e
+        # Sits after the except handlers so that every rank reaches it, including ones
+        # that bypassed or missed above, and after wrap_post_compile so that a local
+        # FXGraphCacheMiss has already downgraded this rank to a miss. Rejecting here
+        # rather than at the call site lets a rejected hit fall into the miss path
+        # below, which populates aot_config.cache_info and is therefore what lets the
+        # resulting compile be saved.
+        synced_fn = sync_cache_decision_cross_ranks(compiled_fn, mod)
+        if compiled_fn is not None and synced_fn is None:
+            cache_state = "miss"
+        compiled_fn = synced_fn
+
         if compiled_fn is None:
             # Set the cache key so we can save a cache result later
             symints = AOTAutogradCache._filter_backed_symints(args)
