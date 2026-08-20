@@ -152,7 +152,17 @@ class CUDACombinedScheduling(BaseScheduling):
             return self._nv_universal_gemm_scheduling.can_fuse_reduction_epilogue(
                 node1, node2
             )
-        return False
+        return self._triton_scheduling.can_fuse_reduction_epilogue(node1, node2)
+
+    def can_fuse_reduction_epilogue_choice(
+        self,
+        node1: BaseSchedulerNode,
+        node2: BaseSchedulerNode,
+        choice: Any,
+    ) -> bool:
+        return self._triton_scheduling.can_fuse_reduction_epilogue_choice(
+            node1, node2, choice
+        )
 
     def group_fn(
         self, sizes: Sequence[Sequence[_IntLike]]

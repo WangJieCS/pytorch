@@ -63,9 +63,12 @@ from .codegen.common import (
     WorkspaceArg,
     WorkspaceZeroMode,
 )
+from .codegen.simd import CantSplit, DerivedIterationRangesRoot, IterationRangesRoot
 from .codegen.simd_kernel_features import SIMDKernelFeatures
 from .codegen.subgraph import SubgraphChoiceCaller
 from .codegen.triton import (
+    TemplateLocalReductionPlan,
+    TemplateLocalReductionStage,
     texpr,
     TMACompatibilityChecker,
     TritonKernel,
@@ -113,7 +116,7 @@ if TYPE_CHECKING:
     import concurrent
 
     from torch._inductor.autotune_process import BenchmarkRequest
-    from torch._inductor.codegen.simd import IterationRangesEntry, IterationRangesRoot
+    from torch._inductor.codegen.simd import IterationRangesEntry
 
     from .codegen.common import CSE
 
@@ -521,6 +524,57 @@ class ModificationWrapper(V.WrapperHandler):  # type: ignore[name-defined]
         return f"tl.broadcast_to({index_str}, {shape})"
 
 
+class _TemplateLocalReductionOpsHandler(V.WrapperHandler):  # type: ignore[name-defined]
+    def __init__(
+        self,
+        inner,
+        kernel: "TritonTemplateKernel",
+        stage: TemplateLocalReductionStage,
+        *,
+        input_shape: tuple[str, ...],
+        tile: tuple[int, int],
+        block: tuple[int, int],
+    ) -> None:
+        super().__init__(inner)
+        self.kernel = kernel
+        self.stage = stage
+        self.input_shape = input_shape
+        self.tile = tile
+        self.block = block
+        self.value: CSEVariable | None = None
+
+    def load(self, name: str, index: sympy.Expr) -> CSEVariable:
+        if name != self.stage.source_name:
+            return self._inner.load(name, index)
+        if self.value is None:
+            value = self._inner.load(name, index)
+            if value.dtype is None:
+                raise AssertionError("reduction source must have a known dtype")
+            if self.stage.source_is_template_tile:
+                tile_m, tile_n = self.tile
+                block_m, block_n = self.block
+                groups_m = tile_m // block_m
+                groups_n = tile_n // block_n
+                value = self.kernel.emit_reshape(
+                    value,
+                    (groups_m, block_m, groups_n, block_n),
+                    value.dtype,
+                )
+                value = self.kernel.cse.generate(
+                    self.kernel.compute,
+                    f"tl.permute({value}, (0, 2, 1, 3))",
+                    dtype=value.dtype,
+                    shape=(groups_m, groups_n, block_m, block_n),
+                )
+            self.value = self.kernel.emit_reshape(value, self.input_shape, value.dtype)
+        return self.value
+
+    def store_reduction(self, name: str, index: sympy.Expr, value: CSEVariable) -> None:
+        if name != self.stage.output_name:
+            raise CantSplit(name, self.stage.output_name)
+        self._inner.store_reduction(name, index, value)
+
+
 # Function name, followed by args and kwargs.
 RecordedEventsType = list[tuple[str, list[Any], dict[str, Any]]]
 
@@ -562,6 +616,7 @@ class TritonTemplateKernel(TritonKernel):
         triton_meta: TritonMeta | None = None,
         always_freeze_layout: bool = False,
         index_dtype_override: str | None = None,
+        template_local_reduction_tile: tuple[int, int] | None = None,
     ) -> None:
         tma_2d = tma_store or tma_load_for_template_epilogue
         if tma_store:
@@ -588,27 +643,9 @@ class TritonTemplateKernel(TritonKernel):
             hint_override=hint_override,
         )
         if tma_2d:
-            # By default `construct_range_trees` will return the range_trees in the order
-            # ["z", "y", "x", "r0_", "r1_"] (see simd.py:all_prefixes)
-            # and this order defines what the kernel block shape will be. So if the template
-            # input / output has requested e.g. ["x", "y"], `construct_range_trees` will still return the
-            # trees in the order ["y", "x"]. This would mean that the template would need to transpose
-            # the loaded value.
-            # The below sorts the range trees according to that required by the caller
-            prefix_to_range_tree = {rt.prefix: rt for rt in self.range_trees}
-            pw_sorted_range_trees = []
-            reduction_idx = None
-            for i, prefix in enumerate(tiling):
-                rt = prefix_to_range_tree[prefix]
-
-                if rt.is_reduction:
-                    reduction_idx = i
-                    break
-                rt.index = i
-                rt.grid_dim = i
-                rt.tensor_dim = i
-                pw_sorted_range_trees.append(rt)
-            self.range_trees = pw_sorted_range_trees + self.range_trees[reduction_idx:]
+            self.range_trees = self._order_template_range_trees(
+                self.range_trees, tiling
+            )
 
         self.input_nodes = input_nodes
         self.output_node = output_node
@@ -671,6 +708,8 @@ class TritonTemplateKernel(TritonKernel):
         self.template_out_shape: str | tuple[str] | None = None
         self.ops_handler: V.WrapperHandler | None = None  # type: ignore[name-defined]
         self.root_var_renames: dict[str, str] = {}
+        self.template_local_reduction_plan: TemplateLocalReductionPlan | None = None
+        self.template_local_reduction_tile = template_local_reduction_tile
 
         # When caching is enabled, the generated code is not dependent on the input nodes names, or
         # symbolic sizes names.
@@ -699,6 +738,137 @@ class TritonTemplateKernel(TritonKernel):
 
         # Tracking for intermediate variables
         self.tmp_var_ctr = itertools.count()
+
+    @staticmethod
+    def _order_template_range_trees(
+        range_trees: Sequence[IterationRangesRoot],
+        tiling: dict[str, sympy.Expr],
+    ) -> list[IterationRangesRoot]:
+        """Order template tensor dimensions according to the caller's tiling."""
+        roots = {tree.prefix: tree for tree in range_trees}
+        ordered = []
+        for tensor_dim, prefix in enumerate(tiling):
+            tree = roots[prefix]
+            if tree.is_reduction:
+                break
+            tree.index = tensor_dim
+            tree.grid_dim = tensor_dim
+            tree.tensor_dim = tensor_dim
+            ordered.append(tree)
+        return ordered + [tree for tree in range_trees if tree.is_reduction]
+
+    def _match_template_local_reduction(
+        self, epilogue_nodes: Sequence[Any]
+    ) -> TemplateLocalReductionPlan | None:
+        if self.template_local_reduction_tile is None:
+            return None
+
+        nodes = [node for epilogue in epilogue_nodes for node in epilogue.get_nodes()]
+        return TritonScheduling._template_local_reduction_plan(self.output_node, nodes)
+
+    def _template_local_reduction_range_trees(
+        self,
+        stage: TemplateLocalReductionStage,
+        tile: tuple[int, int],
+        block: tuple[int, int],
+        stage_index: int,
+    ) -> tuple[
+        tuple[DerivedIterationRangesRoot, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+    ]:
+        tile_m, tile_n = tile
+        block_m, block_n = block
+        groups_m = tile_m // block_m
+        groups_n = tile_n // block_n
+        pid_m = sympy.Symbol("pid_m", integer=True, nonnegative=True)
+        pid_n = sympy.Symbol("pid_n", integer=True, nonnegative=True)
+        znumel = sympy_product(stage.pointwise_ranges[2:])
+        rnumel = sympy_product(stage.reduction_ranges)
+        numels = {
+            "x": stage.pointwise_ranges[0],
+            "y": stage.pointwise_ranges[1],
+        }
+        if not V.graph.sizevars.statically_known_equals(znumel, 1):
+            numels["z"] = znumel
+        numels["r0_"] = rnumel
+        range_trees = self.construct_range_trees(
+            pid_cache=None,
+            inside_reduction=True,
+            is_reduction=True,
+            numels=numels,
+            no_x_dim=False,
+            persistent_reduction=True,
+        )
+        roots = {
+            tree.prefix: tree
+            for tree in self._order_template_range_trees(range_trees, numels)
+        }
+        block_sizes = {
+            "x": sympy.Integer(groups_m),
+            "y": sympy.Integer(groups_n),
+            "z": znumel,
+            "r0_": rnumel,
+        }
+        block_offsets = {
+            "x": pid_m * groups_m,
+            "y": pid_n * groups_n,
+            "z": sympy.S.Zero,
+            "r0_": sympy.S.Zero,
+        }
+        suffix = "block_local" if stage_index == 0 else f"block_local_{stage_index}"
+        local_range_trees = tuple(
+            DerivedIterationRangesRoot(
+                roots[prefix],
+                numel=numel,
+                block_size=block_sizes[prefix],
+                block_offset=block_offsets[prefix],
+                name_suffix=suffix,
+            )
+            for prefix, numel in numels.items()
+        )
+        input_shape = tuple(str(block_sizes[prefix]) for prefix in numels)
+        output_shape = (*input_shape[:-1], "1")
+        return local_range_trees, input_shape, output_shape
+
+    def _codegen_template_local_reductions(self) -> None:
+        plan = self.template_local_reduction_plan
+        if plan is None:
+            return
+        tile = self.template_local_reduction_tile
+        if tile is None:
+            raise AssertionError("expected a template-local reduction tile")
+
+        for stage_index, stage in enumerate(plan.stages):
+            range_trees, input_shape, output_shape = (
+                self._template_local_reduction_range_trees(
+                    stage, tile, plan.block, stage_index
+                )
+            )
+            with (
+                self.use_persistent_reduction_ranges(range_trees),
+                patch.object(self, "template_mask", None),
+                patch.object(self, "template_out_shape", output_shape),
+            ):
+                for tree in range_trees:
+                    self.iteration_ranges_codegen_header(tree, self.body)
+                handler = _TemplateLocalReductionOpsHandler(
+                    V.get_ops_handler(),
+                    self,
+                    stage,
+                    input_shape=input_shape,
+                    tile=tile,
+                    block=plan.block,
+                )
+                node = stage.reduction_node
+                loop_state = node.snapshot_loop_state()
+                try:
+                    node.apply_loop_reindexing(stage.pointwise_ranges)
+                    with V.set_ops_handler(handler):
+                        node.codegen(self.split_and_set_ranges(node.get_ranges()))
+                finally:
+                    node.restore_loop_state(loop_state)
+                self.codegen_body()
 
     @property
     def index_dtype(self) -> str:
@@ -1951,8 +2121,24 @@ class TritonTemplateKernel(TritonKernel):
         none unfused, no prologue source tracking.  Override in subclasses
         for per-output routing.
         """
+        local_reduction_plan = self._match_template_local_reduction(epilogue_nodes)
+        if local_reduction_plan is not None:
+            if not TritonScheduling._template_local_reduction_tile_is_compatible(
+                self.template_local_reduction_tile, local_reduction_plan.block
+            ):
+                raise CantSplit(
+                    self.template_local_reduction_tile,
+                    OrderedSet((local_reduction_plan.block,)),
+                )
+            self.template_local_reduction_plan = local_reduction_plan
+            for stage in local_reduction_plan.stages:
+                if stage.output_name not in V.graph.removed_buffers:
+                    self.args.output(stage.output_name)
+            routed_epilogues: list[Any] = list(local_reduction_plan.pointwise_nodes)
+        else:
+            routed_epilogues = epilogue_nodes
         self._epilogue_nodes_by_subgraph: defaultdict[int, list[Any]] = defaultdict(
-            lambda: epilogue_nodes
+            lambda: routed_epilogues
         )
         self._unfused_epilogues: list[Any] = []
         self._prologue_sources: dict[str, frozenset[str]] = {}
@@ -1978,11 +2164,18 @@ class TritonTemplateKernel(TritonKernel):
             partial_code = render()
 
             num_store_subgraphs = self.get_store_output_count()
+            if (
+                self.template_local_reduction_plan is not None
+                and num_store_subgraphs != 1
+            ):
+                raise CantSplit(num_store_subgraphs, 1)
             for i in range(num_store_subgraphs):
                 subgraph_name = self._get_store_output_subgraph_name(i)
                 with self.set_subgraph_body(subgraph_name):
                     for node in self._epilogue_nodes_by_subgraph[i]:
                         node.codegen(self.split_and_set_ranges(node.get_ranges()))
+                    if self.template_local_reduction_plan is not None:
+                        self._codegen_template_local_reductions()
                     self.cse.invalidate(OrderedSet())
 
             self.codegen_prologues_in_subgraphs(
@@ -2698,6 +2891,7 @@ class TritonTemplate(KernelTemplate):
         cache_codegen_enabled_for_template=False,
         prologue_loads_all_inputs=False,
         always_freeze_layout: bool = False,
+        supports_template_local_reduction: bool = False,
     ) -> None:
         super().__init__(name, hash=hashlib.sha256(source.encode("utf-8")).hexdigest())
         self.grid = grid
@@ -2721,6 +2915,7 @@ class TritonTemplate(KernelTemplate):
         # immediately instead of using layout constraints. This is used by
         # FlexAttention templates which require frozen layouts.
         self.always_freeze_layout = always_freeze_layout
+        self.supports_template_local_reduction = supports_template_local_reduction
 
     # When this flag is on, we ensure that the cached results and the generated result if cache
     # was not used are the same.
@@ -2835,6 +3030,11 @@ class TritonTemplate(KernelTemplate):
         # Add index dtype to defines so it's available in the template
         defines.write(f"INDEX_DTYPE : tl.constexpr = {index_dtype}\n")
         defines = defines.getvalue()
+        template_local_reduction_tile = (
+            (kwargs["BLOCK_M"], kwargs["BLOCK_N"])
+            if self.supports_template_local_reduction
+            else None
+        )
 
         kernel_options = {
             "input_nodes": input_nodes,
@@ -2851,6 +3051,7 @@ class TritonTemplate(KernelTemplate):
             "prologue_loads_all_inputs": self.prologue_loads_all_inputs,
             "always_freeze_layout": self.always_freeze_layout,
             "index_dtype_override": index_dtype,
+            "template_local_reduction_tile": template_local_reduction_tile,
         }
 
         if HAS_WARP_SPEC:
@@ -3222,6 +3423,7 @@ class TritonTemplate(KernelTemplate):
             workspace_arg=workspace_arg,
             allowed_prologue_inps=result.prologue_supported_inputs,
             hint_override=hint_override,
+            template_local_reduction_tile=options["template_local_reduction_tile"],
         )
 
 
@@ -3364,6 +3566,7 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
         workspace_arg: WorkspaceArg | None = None,
         allowed_prologue_inps: OrderedSet[str] | None = None,
         hint_override: int | None = None,
+        template_local_reduction_tile: tuple[int, int] | None = None,
     ) -> None:
         super().__init__(name, input_nodes, layout, description)
         self.make_kernel_render = make_kernel_render
@@ -3384,6 +3587,7 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
             allowed_prologue_inps if allowed_prologue_inps is not None else OrderedSet()
         )
         self.hint_override = hint_override
+        self.template_local_reduction_tile = template_local_reduction_tile
 
         self.n_regs = None
 
@@ -3427,6 +3631,7 @@ class TritonTemplateCaller(ir.TritonTemplateCallerBase):
             make_kernel_render=self.make_kernel_render,
             mutated_inputs=self.mutated_inputs,
             allowed_prologue_inps=self.allowed_prologue_inps,
+            template_local_reduction_tile=self.template_local_reduction_tile,
         )
         # Pass KTC annotation to the buffer for encoding
         if "ktc" in self.annotations:
