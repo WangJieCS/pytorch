@@ -28,9 +28,10 @@ log = logging.getLogger(__name__)
 
 _FLYDSL_DSL_NAME = "flydsl"
 
-# Kernels registered through this gate are written against the FlyDSL 0.3.x
-# flydsl.expr.gpu.shuffle_xor interface. Other versions fall back to ATen
-# unless a developer explicitly sets TORCH_NATIVE_SKIP_VERSION_CHECK=1.
+# The kernels this gate protects -- see ops/norm/flydsl_rmsnorm_fwd.py -- are
+# written against the FlyDSL 0.3.x flydsl.expr.gpu.shuffle_xor interface. Other
+# versions fall back to ATen unless a developer explicitly sets
+# TORCH_NATIVE_SKIP_VERSION_CHECK=1.
 _FLYDSL_SUPPORTED_RELEASES = ((0, 3),)
 
 
@@ -109,11 +110,12 @@ def _get_flydsl_device_arch(device_index: int) -> str | None:
     return None
 
 
+@functools.cache
 def _resolve_rocm_arch(device_index: int) -> str | None:
     """Return the gfx name to compile for, or None if it cannot be determined.
 
     FLYDSL_GPU_ARCH wins, then HSA_OVERRIDE_GFX_VERSION, then the device's
-    cached gcnArchName. Environment overrides are read on every call.
+    cached gcnArchName. The normalized result is cached per device.
     """
     env = _environ.get("FLYDSL_GPU_ARCH")
     if env:
@@ -122,7 +124,7 @@ def _resolve_rocm_arch(device_index: int) -> str | None:
     hsa = _environ.get("HSA_OVERRIDE_GFX_VERSION")
     if hsa:
         if hsa.startswith("gfx"):
-            return hsa
+            return hsa.split(":", 1)[0]
         if hsa.count(".") == 2:
             major, minor, stepping = hsa.split(".")
             try:
